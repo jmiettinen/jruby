@@ -12,59 +12,58 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Maps Java objects to their proxies.  Combines elements of WeakHashMap and
- * ConcurrentHashMap to permit unsynchronized reads.  May be configured to
+ * ConcurrentHashMap to permit non-synchronized reads.  May be configured to
  * use either Weak (the default) or Soft references.<p>
- * 
+ *
  * Note that both Java objects and their proxies are held by weak/soft
  * references; because proxies (currently) keep strong references to their
  * Java objects, if we kept strong references to them the Java objects would
  * never be gc'ed.  This presents a problem in the case where a user passes
- * a Rubified Java object out to Java but keeps no reference in Ruby to the 
+ * a Rubified Java object out to Java but keeps no reference in Ruby to the
  * proxy; if the object is returned to Ruby after its proxy has been gc'ed,
  * a new (and possibly very wrong, in the case of JRuby-defined subclasses)
  * proxy will be created.  Use of soft references may help reduce the
  * likelihood of this occurring; users may be advised to keep Ruby-side
  * references to prevent it occurring altogether.
- * 
+ *
  * @author <a href="mailto:bill.dortch@gmail.com">Bill Dortch</a>
- * 
+ *
  */
 public abstract class ObjectProxyCache<T,A> {
 
     private static final Logger LOG = LoggerFactory.getLogger("ObjectProxyCache");
-    
+
     public static enum ReferenceType { WEAK, SOFT }
-    
+
     private static final int DEFAULT_SEGMENTS = 16; // must be power of 2
     private static final int DEFAULT_SEGMENT_SIZE = 8; // must be power of 2
     private static final float DEFAULT_LOAD_FACTOR = 0.75f;
     private static final int MAX_CAPACITY = 1 << 30;
     private static final int MAX_SEGMENTS = 1 << 16;
     private static final int VULTURE_RUN_FREQ_SECONDS = 5;
-    
+
     private static int _nextId = 0;
-    
+
     private static synchronized int nextId() {
         return ++_nextId;
     }
 
-    
+
     private final ReferenceType referenceType;
     private final Segment<T,A>[] segments;
     private final int segmentShift;
     private final int segmentMask;
     private Thread vulture;
     private final int id;
-    
+
     public ObjectProxyCache() {
         this(DEFAULT_SEGMENTS, DEFAULT_SEGMENT_SIZE, ReferenceType.WEAK);
     }
-    
+
     public ObjectProxyCache(ReferenceType refType) {
         this(DEFAULT_SEGMENTS, DEFAULT_SEGMENT_SIZE, refType);
     }
-    
-    
+
     public ObjectProxyCache(int numSegments, int initialSegCapacity, ReferenceType refType) {
         if (numSegments <= 0 || initialSegCapacity <= 0 || refType == null) {
             throw new IllegalArgumentException();
@@ -72,7 +71,7 @@ public abstract class ObjectProxyCache<T,A> {
         this.id = nextId();
         this.referenceType = refType;
         if (numSegments > MAX_SEGMENTS) numSegments = MAX_SEGMENTS;
-    
+
         // Find power-of-two sizes best matching arguments
         int sshift = 0;
         int ssize = 1;
@@ -81,18 +80,18 @@ public abstract class ObjectProxyCache<T,A> {
             ssize <<= 1;
         }
         // note segmentShift differs from ConcurrentHashMap's calculation due to
-        // issues with System.identityHashCode (upper n bits always 0, at least 
+        // issues with System.identityHashCode (upper n bits always 0, at least
         // under Java 1.6 / WinXP)
         this.segmentShift = 24 - sshift;
         this.segmentMask = ssize - 1;
         this.segments = Segment.newArray(ssize);
-    
+
         if (initialSegCapacity > MAX_CAPACITY) {
             initialSegCapacity = MAX_CAPACITY;
         }
         int cap = 1;
         while (cap < initialSegCapacity) cap <<= 1;
-    
+
         for (int i = ssize; --i >= 0; ) {
             segments[i] = new Segment<T,A>(cap, this);
         }
@@ -118,11 +117,8 @@ public abstract class ObjectProxyCache<T,A> {
                             }
                             for (int i = segments.length; --i >= 0; ) {
                                 Segment<T,A> seg = segments[i];
-                                seg.lock();
-                                try {
+                                synchronized (seg) {
                                     seg.expunge();
-                                } finally {
-                                    seg.unlock();
                                 }
                                 yield();
                             }
@@ -138,38 +134,38 @@ public abstract class ObjectProxyCache<T,A> {
             this.vulture = null;
         }
 
-        
+
         // FIXME: vulture daemon thread prevents finalization,
         // find alternative approach.
         // vulture.start();
 
 //      System.err.println("***ObjectProxyCache " + id + " started at "+ new java.util.Date());
     }
-    
+
 //    protected void finalize() throws Throwable {
 //        System.err.println("***ObjectProxyCache " + id + " finalized at "+ new java.util.Date());
 //    }
-    
+
     public abstract T allocateProxy(Object javaObject, A allocator);
-    
+
     public T get(Object javaObject) {
         if (javaObject == null) return null;
         int hash = hash(javaObject);
         return segmentFor(hash).get(javaObject, hash);
     }
-    
+
     public T getOrCreate(Object javaObject, A allocator) {
         if (javaObject == null || allocator == null) return null;
         int hash = hash(javaObject);
         return segmentFor(hash).getOrCreate(javaObject, hash, allocator);
     }
-    
+
     public void put(Object javaObject, T proxy) {
         if (javaObject == null || proxy == null) return;
         int hash = hash(javaObject);
         segmentFor(hash).put(javaObject, hash, proxy);
     }
-    
+
     private static int hash(Object javaObject) {
         int h = System.identityHashCode(javaObject);
         h ^= (h >>> 20) ^ (h >>> 12);
@@ -179,13 +175,13 @@ public abstract class ObjectProxyCache<T,A> {
     private Segment<T,A> segmentFor(int hash) {
         return segments[(hash >>> segmentShift) & segmentMask];
     }
-    
+
     /**
      * Returns the approximate size (elements in use) of the cache. The
      * sizes of the segments are summed. No effort is made to synchronize
      * across segments, so the value returned may differ from the actual
      * size at any point in time.
-     * 
+     *
      * @return
      */
     public int size() {
@@ -195,7 +191,7 @@ public abstract class ObjectProxyCache<T,A> {
        }
        return size;
     }
-    
+
     public String stats() {
         StringBuilder b = new StringBuilder();
         int n = 0;
@@ -205,12 +201,9 @@ public abstract class ObjectProxyCache<T,A> {
         for (Segment<T,A> seg : segments) {
             int ssize = 0;
             int salloc = 0;
-            seg.lock();
-            try {
+            synchronized (seg) {
                 ssize = seg.count();
                 salloc = seg.entryTable.length;
-            } finally {
-                seg.unlock();
             }
             size += ssize;
             alloc += salloc;
@@ -221,7 +214,7 @@ public abstract class ObjectProxyCache<T,A> {
             .append("  alloc: ").append(alloc).append("\n");
         return b.toString();
     }
-    
+
     // EntryRefs include hash with key to facilitate lookup by Segment#expunge
     // after ref is removed from ReferenceQueue
     private static interface EntryRef<T> {
@@ -261,7 +254,7 @@ public abstract class ObjectProxyCache<T,A> {
         final int hash;
         final EntryRef<T> proxyRef;
         final Entry<T> next;
-        
+
         Entry(Object object, int hash, T proxy, ReferenceType type, Entry<T> next, ReferenceQueue<Object> queue) {
             this.hash = hash;
             this.next = next;
@@ -277,7 +270,7 @@ public abstract class ObjectProxyCache<T,A> {
                 this.proxyRef = new SoftEntryRef<T>(hash, proxy, queue);
             }
         }
-        
+
         // ctor used by remove/rehash
         Entry(EntryRef<Object> objectRef, int hash, EntryRef<T> proxyRef, Entry<T> next) {
             this.objectRef = objectRef;
@@ -285,17 +278,17 @@ public abstract class ObjectProxyCache<T,A> {
             this.proxyRef = proxyRef;
             this.next = next;
         }
-        
+
         @SuppressWarnings("unchecked")
         static final <T> Entry<T>[] newArray(int size) {
             return new Entry[size];
         }
      }
-    
+
     // lame generics issues: making Segment class static and manually
     // inserting cache reference to work around various problems generically
     // referencing methods/vars across classes.
-    static class Segment<T,A> extends ReentrantLock {
+    static class Segment<T,A> {
 
         final ObjectProxyCache<T,A> cache;
         final ReferenceQueue<Object> referenceQueue = new ReferenceQueue<Object>();
@@ -308,9 +301,8 @@ public abstract class ObjectProxyCache<T,A> {
             entryTable = Entry.newArray(capacity);
             this.cache = cache;
         }
-        
-        // must be called under lock
-        private void expunge() {
+
+        private synchronized void expunge() {
             Entry<T>[] table = entryTable;
             ReferenceQueue<Object> queue = referenceQueue;
             EntryRef ref;
@@ -327,9 +319,8 @@ public abstract class ObjectProxyCache<T,A> {
                 }
             }
         }
-        
-        // must be called under lock
-        private void remove(Entry<T>[] table, int hash, Entry<T> e) {
+
+        private synchronized void remove(Entry<T>[] table, int hash, Entry<T> e) {
             int index = hash & (table.length - 1);
             Entry<T> first = table[index];
             for (Entry<T> n = first; n != null; n = n.next) {
@@ -347,8 +338,7 @@ public abstract class ObjectProxyCache<T,A> {
         }
 
         // temp method to verify tableSize value
-        // must be called under lock
-        private int count() {
+        private synchronized int count() {
             int count = 0;
             for (Entry<T> e : entryTable) {
                 while (e != null) {
@@ -359,8 +349,7 @@ public abstract class ObjectProxyCache<T,A> {
             return count;
         }
 
-        // must be called under lock
-        private Entry<T>[] rehash() {
+        private synchronized Entry<T>[] rehash() {
             assert tableSize == count() : "tableSize "+tableSize+" != count() "+count();
             Entry<T>[] oldTable = entryTable; // read-volatile
             int oldCapacity;
@@ -405,8 +394,7 @@ public abstract class ObjectProxyCache<T,A> {
         }
 
         void put(Object object, int hash, T proxy) {
-            lock();
-            try {
+            synchronized (this) {
                 expunge();
                 Entry<T>[] table;
                 int potentialNewSize;
@@ -432,8 +420,6 @@ public abstract class ObjectProxyCache<T,A> {
                 table[index] = e;
                 tableSize = potentialNewSize;
                 entryTable = table; // write-volatile
-            } finally {
-                unlock();
             }
         }
 
@@ -446,8 +432,7 @@ public abstract class ObjectProxyCache<T,A> {
                     break;
                 }
             }
-            lock();
-            try {
+            synchronized (this) {
                 expunge();
                 int potentialNewSize;
                 if ((potentialNewSize = tableSize + 1) > threshold) {
@@ -472,11 +457,9 @@ public abstract class ObjectProxyCache<T,A> {
                 tableSize = potentialNewSize;
                 entryTable = table; // write-volatile
                 return proxy;
-            } finally {
-                unlock();
             }
         }
-        
+
         T get(Object object, int hash) {
             Entry<T>[] table;
             for (Entry<T> e = (table = entryTable)[hash & table.length - 1]; e != null; e = e.next) {
